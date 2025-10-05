@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+langchain
+langchain_community
+ctransformers[cuda]  # or remove [cuda] if you only have a CPU
+llama-cpp-python
+ultralytics
+opencv-python-headless
+pdfplumber
+openpyxl
+python-pptx
+presidio-analyzer
+presidio-anonymizer
+spacy
