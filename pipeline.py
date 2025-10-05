@@ -72,7 +72,7 @@ def get_llm():
             _llm = CTransformers(
                 model=str(MODEL_DIR / "mistral-7b-instruct-v0.2.Q5_K_M.gguf"),
                 model_type="mistral",
-                config={'context_length': 4096, 'gpu_layers': 0}
+                config={'context_length': 8192, 'gpu_layers': 0}
             )
         except Exception as e:
             print(f"Warning: Could not load Mistral LLM: {e}")
@@ -82,7 +82,7 @@ def get_llm():
 def get_analyzer():
     """Get Presidio analyzer with comprehensive PII and technical data recognizers"""
     global _analyzer
-    if _analyzer is None:
+    if (_analyzer is None):
         # AWS and Cloud Infrastructure Patterns
         aws_patterns = [
             Pattern(name="AWS_ARN", regex=r"arn:aws:[a-z0-9\-]+:[a-z0-9\-]*:[0-9]{12}:[a-zA-Z0-9\-\/\:\_]+", score=0.95),
@@ -116,6 +116,10 @@ def get_analyzer():
         name_patterns = [
             Pattern(name="ROLE_NAME", regex=r"(role|Role)[-_]?[nN]ame[\"']?\s*:?\s*[\"']?([A-Za-z0-9\-\_]+)", score=0.8),
             Pattern(name="GROUP_NAME", regex=r"(group|Group)[-_]?[nN]ame[\"']?\s*:?\s*[\"']?([A-Za-z0-9\-\_]+)", score=0.8),
+            # Original pattern, good for single-line rule names
+            Pattern(name="FIREWALL_RULE_NAME", regex=r"\bdefault-[a-z\-]+\b", score=0.9),
+            # New, more flexible pattern for multi-line or partial rule names
+            Pattern(name="FIREWALL_RULE_PREFIX", regex=r"\b(default-allow-|default-deny-)\b", score=0.85),
         ]
         
         # Session and duration
@@ -347,6 +351,15 @@ def process_text_image(file_path: Path, analyzer_engine: AnalyzerEngine):
     if img is None:
         return None, "Error: Could not read image"
     
+    # --- SPEED OPTIMIZATION: Resize large images before processing ---
+    MAX_DIMENSION = 1800
+    h, w, _ = img.shape
+    if h > MAX_DIMENSION or w > MAX_DIMENSION:
+        scale = MAX_DIMENSION / max(h, w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        print(f"Resized image from {w}x{h} to {new_w}x{new_h}")
+
     # Improve image quality for better OCR
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     # Apply adaptive thresholding to improve text clarity
@@ -360,11 +373,11 @@ def process_text_image(file_path: Path, analyzer_engine: AnalyzerEngine):
     full_text_for_analysis = " ".join(word for word in ocr_data['text'] if word.strip())
     
     if not full_text_for_analysis:
-        print("No text detected.")
-        redacted_filename = f"{file_path.stem}_redacted_no_text.png"
-        redacted_path = REDACTED_DIR / redacted_filename
-        cv2.imwrite(str(redacted_path), img)
-        return redacted_path, "No text could be extracted from the image."
+        print("No text detected. Using VLM for description.")
+        # If no text, use LLaVA for a general description
+        _, analysis_text = process_scenic_image(file_path)
+        # Since no PII was found, return the original image path instead of a redacted one
+        return file_path, analysis_text
     
     # Comprehensive PII analysis with all entity types
     analyzer_results = analyzer_engine.analyze(
@@ -379,6 +392,13 @@ def process_text_image(file_path: Path, analyzer_engine: AnalyzerEngine):
         ]
     )
     
+    # If no PII is found, use VLM for a description instead of returning raw text
+    if not analyzer_results:
+        print("No PII found in text. Using VLM for a visual description.")
+        _, analysis_text = process_scenic_image(file_path)
+        # Return the original image path as no redaction is needed
+        return file_path, analysis_text
+
     # Create character-level PII index
     pii_char_indices = set()
     for res in analyzer_results:
@@ -454,7 +474,8 @@ def process_pdf(file_path: Path):
                 all_text = []
                 
                 for page_num, page in enumerate(pdf.pages):
-                    img = page.to_image(resolution=300).original
+                    # --- SPEED OPTIMIZATION: Lower resolution for scanned PDFs ---
+                    img = page.to_image(resolution=150).original # Was 300
                     temp_image_path = UPLOAD_DIR / f"{file_path.stem}_page{page_num+1}.png"
                     img.save(temp_image_path, format="PNG")
                     
