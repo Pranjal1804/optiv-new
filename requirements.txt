@@ -1,15 +1,31 @@
+# Core web framework
 fastapi
 uvicorn[standard]
 python-multipart
+
+# LangChain and LLM libraries
 langchain
 langchain_community
-ctransformers[cuda]  # or remove [cuda] if you only have a CPU
-llama-cpp-python
-ultralytics
-opencv-python-headless
-pdfplumber
-openpyxl
-python-pptx
+ctransformers[cuda]      # For Mistral model. Use 'ctransformers' if you only have a CPU.
+llama-cpp-python         # For LLaVA model. Re-install with CUDA for GPU support.
+
+# Computer Vision and OCR
+ultralytics              # For YOLO object detection
+opencv-python-headless   # For image processing
+pytesseract              # For Optical Character Recognition (OCR)
+Pillow                   # For image manipulation (PIL)
+
+# Document and Data Processing
+pdfplumber               # For PDF text extraction
+openpyxl                 # For Excel file (.xlsx) processing
+python-pptx              # For PowerPoint file (.pptx) processing
+pandas                   # For Excel data manipulation
+numpy                    # Core library for numerical operations
+
+# Presidio PII Detection
 presidio-analyzer
 presidio-anonymizer
 spacy
+
+# After installing these packages, you must also download the spacy model:
+# python -m spacy download en_core_web_lg
