@@ -47,7 +47,7 @@ def get_yolo_model():
 def get_llava_model():
     """Load LLaVA model (lazy loading)"""
     global _llava_model
-    if _llava_model is None:
+    if (_llava_model is None):
         try:
             _llava_model = ChatLlamaCpp(
                 model_path=str(MODEL_DIR / "ggml-model-q5_k.gguf"),
@@ -185,22 +185,63 @@ def get_anonymizer():
 
 
 # --- Main Processing Function (This is what main.py should import) ---
-def process_image(file_path: Path, is_scenic: bool = False):
+def process_image(file_path: Path):
     """
-    Main function to process images - handles both scenic and text-heavy images
+    Main function to process images. It now uses LLaVA to intelligently decide
+    the best processing path (scenic vs. text-heavy).
     
     Args:
         file_path: Path to the image file
-        is_scenic: If True, uses YOLO+LLaVA for scenic images. 
-                   If False, uses OCR+Presidio for text-heavy images
     
     Returns:
         tuple: (redacted_file_path, analysis_text)
     """
-    if is_scenic:
-        return process_scenic_image(file_path)
-    else:
-        return process_text_image(file_path, get_analyzer())
+    print("Starting intelligent image processing...")
+    llava_model = get_llava_model()
+    if not llava_model:
+        print("LLaVA model not available. Falling back to simple text check.")
+        is_scenic = is_image_scenic_fallback(file_path)
+        if is_scenic:
+            return process_scenic_image(file_path)
+        else:
+            return process_text_image(file_path, get_analyzer())
+
+    # Use LLaVA to get an initial description of the image.
+    print("Using LLaVA for initial image assessment...")
+    try:
+        image_path_uri = file_path.resolve().as_uri()
+        # This prompt asks LLaVA to classify the image type for us.
+        prompt = "Is this image a real-world photograph of people or objects, or is it a computer screenshot of a user interface, dashboard, or document? Describe the content."
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_path_uri}},
+            ]
+        )
+        response = llava_model.invoke([message])
+        initial_analysis = response.content.lower()
+        print(f"LLaVA assessment: {initial_analysis}")
+
+        # Keywords to identify a screenshot or technical document.
+        text_heavy_keywords = ['screenshot', 'user interface', 'dashboard', 'policy', 'firewall', 'azure', 'aws', 'gcp', 'table', 'text', 'code']
+        
+        # Decide the path based on LLaVA's description.
+        if any(keyword in initial_analysis for keyword in text_heavy_keywords):
+            print("LLaVA identified a text-heavy image/screenshot. Processing with vision-based text extraction.")
+            # For screenshots, we trust LLaVA's reading ability over OCR.
+            # We ask it to read the text and then format it.
+            return process_screenshot_with_llava(file_path)
+        else:
+            print("LLaVA identified a scenic image. Processing with YOLO and LLaVA description.")
+            return process_scenic_image(file_path)
+
+    except Exception as e:
+        print(f"An error occurred during LLaVA assessment: {e}. Falling back to old method.")
+        is_scenic = is_image_scenic_fallback(file_path)
+        if is_scenic:
+            return process_scenic_image(file_path)
+        else:
+            return process_text_image(file_path, get_analyzer())
 
 
 def process_file(file_path: Path, file_type: str = None):
@@ -227,14 +268,12 @@ def process_file(file_path: Path, file_type: str = None):
     ext = file_path.suffix.lower()
     
     if ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']:
-        # Determine if scenic or text-heavy
-        # Simple heuristic: if image has a lot of text (OCR confidence), it's text-heavy
-        is_scenic = is_image_scenic(file_path)
-        redacted_path, analysis = process_image(file_path, is_scenic=is_scenic)
+        # The main process_image function now handles the logic internally.
+        redacted_path, analysis = process_image(file_path)
         return {
             'redacted_path': redacted_path,
             'analysis': analysis,
-            'file_type': 'scenic_image' if is_scenic else 'text_image'
+            'file_type': 'image'
         }
     
     elif ext == '.pdf':
@@ -265,15 +304,10 @@ def process_file(file_path: Path, file_type: str = None):
         raise ValueError(f"Unsupported file type: {ext}")
 
 
-def is_image_scenic(file_path: Path) -> bool:
+def is_image_scenic_fallback(file_path: Path) -> bool:
     """
-    Determine if an image is scenic (photo-like) or text-heavy (screenshot/document)
-    
-    Args:
-        file_path: Path to image
-    
-    Returns:
-        bool: True if scenic, False if text-heavy
+    Fallback function to determine if an image is scenic or text-heavy.
+    Only used if the primary LLaVA assessment fails.
     """
     try:
         img = cv2.imread(str(file_path))
@@ -290,11 +324,80 @@ def is_image_scenic(file_path: Path) -> bool:
         
         return True
     except Exception as e:
-        print(f"Error detecting image type: {e}")
+        print(f"Error in fallback image type detection: {e}")
         return False  # Default to text-heavy for safety
 
 
 # --- Processing Functions ---
+def process_screenshot_with_llava(file_path: Path):
+    """
+    Advanced function to process screenshots:
+    1. LLaVA reads the text.
+    2. Presidio finds PII in the text.
+    3. Tesseract OCR maps text to image locations.
+    4. OpenCV blacks out the PII on the image.
+    5. Mistral formats the clean text into a professional report.
+    """
+    print(f"Processing screenshot with LLaVA: {file_path.name}")
+    llava_model = get_llava_model()
+    
+    # Step 1: Use LLaVA to accurately read all text from the screenshot.
+    read_prompt = "Transcribe all text from the image. If it's a table, maintain the row and column structure."
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": read_prompt},
+            {"type": "image_url", "image_url": {"url": file_path.resolve().as_uri()}},
+        ]
+    )
+    response = llava_model.invoke([message])
+    extracted_text = response.content
+    print("LLaVA has extracted the text from the screenshot.")
+
+    # Step 2: Analyze the high-quality text for PII using Presidio.
+    analyzer = get_analyzer()
+    analyzer_results = analyzer.analyze(text=extracted_text, language='en')
+    
+    # --- NEW REDACTION LOGIC ---
+    # Step 3: Get word-level bounding boxes from Tesseract OCR.
+    img = cv2.imread(str(file_path))
+    redacted_img = img.copy()
+    ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    
+    # Step 4: Redact PII found by Presidio using OCR bounding boxes.
+    pii_locations = [(res.start, res.end) for res in analyzer_results]
+    
+    full_ocr_text = ""
+    word_map = [] # Stores (word, start_index, end_index, box)
+    
+    for i, word in enumerate(ocr_data['text']):
+        if word.strip() and int(ocr_data['conf'][i]) > 30: # Only consider confident words
+            start_index = len(full_ocr_text)
+            full_ocr_text += word + " "
+            end_index = len(full_ocr_text) - 1
+            box = (ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i])
+            word_map.append((word, start_index, end_index, box))
+
+    # Find and redact words that overlap with Presidio's PII findings
+    for word, start, end, box in word_map:
+        for pii_start, pii_end in pii_locations:
+            # Check for overlap between word and PII span
+            if max(start, pii_start) < min(end, pii_end):
+                (x, y, w, h) = box
+                cv2.rectangle(redacted_img, (x, y), (x + w, y + h), (0, 0, 0), -1)
+                break # Move to next word once redacted
+
+    redacted_filename = f"{file_path.stem}_redacted_llava.png"
+    redacted_path = REDACTED_DIR / redacted_filename
+    cv2.imwrite(str(redacted_path), redacted_img)
+    print(f"Redacted image saved to {redacted_path}")
+    # --- END NEW REDACTION LOGIC ---
+
+    # Step 5: Format the clean text into the final analysis using the improved prompt.
+    formatted_analysis = format_technical_analysis(extracted_text)
+    
+    return redacted_path, formatted_analysis
+
+
 def process_scenic_image(file_path: Path):
     """Handles redaction and analysis for SCENIC images (non-text) using YOLO and LLaVA."""
     print(f"Processing scenic image: {file_path.name}")
@@ -597,27 +700,51 @@ def process_powerpoint(file_path: Path):
 
 # --- Formatting Functions ---
 def format_technical_analysis(analysis_text: str):
-    """Uses LangChain to format technical data into the desired table structure."""
-    print("Formatting final technical analysis...")
+    """Uses LangChain to format technical data into a professional, structured report."""
+    print("Formatting final technical analysis with improved prompt...")
     
     llm = get_llm()
     if llm is None:
         return f"**File Description**: Analysis text\n\n**Key Findings**:\n{analysis_text[:500]}"
     
+    # --- NEW, MORE ROBUST PROMPT ---
     template = """
-    You are a helpful cybersecurity analyst AI. Based on the following text, provide a clear 'File Description' and detailed 'Key Findings'.
-    For 'Key Findings', extract each rule or key item, its parameters, and explain its purpose in a bulleted list.
-    
-    Extracted Text:
+    You are an expert cybersecurity analyst. Your task is to convert the following raw text, which may contain OCR errors, into a clean, professional report.
+
+    **Instructions**:
+    1.  **File Description**: Write a single, concise sentence describing the document's purpose (e.g., "A list of Google Cloud VPC firewall rules.").
+    2.  **Key Findings**:
+        -   Analyze each rule or policy found in the text.
+        -   Present each rule clearly, with each attribute on a new line.
+        -   Correct obvious OCR errors (e.g., 'teep' should be 'tcp').
+        -   If a value is redacted or missing, state 'N/A' or 'Redacted'.
+        -   Provide a clear, one-sentence 'Purpose' for each rule.
+    3.  **Format**: Follow the output format below EXACTLY. Do not add extra commentary.
+
+    **Raw Text Input**:
     {analysis}
-    
-    Your Formatted Output:
-    **File Description**: [Provide a concise, one-sentence summary of the content]
-    
+
+    **Required Output Format**:
+
+    **File Description**: [Your one-sentence summary here]
+
     **Key Findings**:
-    * **Rule Name**: [Extract Rule 1 Name] - **Source**: [e.g., 0.0.0.0/0] - **Action**: [Allow/Deny] - **Protocol/Port**: [e.g., tcp:22] - **Purpose**: [Explain the purpose]
-    * **Rule Name**: [Extract Rule 2 Name] - **Source**: [e.g., 10.128.0.0/9] - **Action**: [Allow/Deny] - **Protocol/Port**: [e.g., tcp:0-65535] - **Purpose**: [Explain the purpose]
-    * (Continue for all items found)
+
+    *   **Rule Name**: [Name of Rule 1]
+        **Direction**: [e.g., ingress]
+        **Source**: [e.g., 0.0.0.0/0]
+        **Action**: [e.g., allow]
+        **Protocols/Ports**: [e.g., tcp:22]
+        **Purpose**: [Concise explanation of the rule's function.]
+
+    *   **Rule Name**: [Name of Rule 2]
+        **Direction**: [e.g., ingress]
+        **Source**: [e.g., 10.128.0.0/9]
+        **Action**: [e.g., allow]
+        **Protocols/Ports**: [e.g., udp:0-65535, icmp]
+        **Purpose**: [Concise explanation of the rule's function.]
+    
+    (Continue this pattern for all rules found in the raw text)
     """
     
     try:
@@ -721,6 +848,7 @@ __all__ = [
     'process_powerpoint',
     'process_scenic_image',
     'process_text_image',
+    'process_screenshot_with_llava',
     'redact_text_in_image',  # Added for main.py compatibility
     'format_technical_analysis',
     'format_generic_output',
