@@ -1,0 +1,166 @@
+/* filepath: frontend/style.css */
+:root {
+    --background-color: #121212;
+    --surface-color: #1e1e1e;
+    --primary-text-color: #e0e0e0;
+    --secondary-text-color: #a0a0a0;
+    --border-color: #333;
+    --accent-gradient: linear-gradient(90deg, #434343 0%, #000000 100%);
+}
+
+body {
+    font-family: 'Inter', sans-serif;
+    background-color: var(--background-color);
+    color: var(--primary-text-color);
+    margin: 0;
+    padding: 2rem;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-height: 100vh;
+}
+
+.container {
+    width: 100%;
+    max-width: 800px;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 3rem;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 1.5rem;
+}
+
+header h1 {
+    font-size: 2.5rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+}
+
+header p {
+    color: var(--secondary-text-color);
+    font-size: 1.1rem;
+}
+
+#upload-form {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.file-label {
+    border: 2px dashed var(--border-color);
+    border-radius: 8px;
+    padding: 3rem 1rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.3s, background-color 0.3s;
+}
+
+.file-label:hover, .file-label.dragover {
+    border-color: var(--primary-text-color);
+    background-color: #2a2a2a;
+}
+
+#file-input {
+    display: none;
+}
+
+#file-name {
+    color: var(--secondary-text-color);
+}
+
+.button, button {
+    background: var(--accent-gradient);
+    color: var(--primary-text-color);
+    border: none;
+    padding: 1rem 2rem;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+}
+
+.button:hover, button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+}
+
+button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.spinner-container {
+    text-align: center;
+    padding: 2rem;
+}
+
+.spinner {
+    border: 4px solid rgba(255, 255, 255, 0.2);
+    border-left-color: var(--primary-text-color);
+    border-radius: 50%;
+    width: 50px;
+    height: 50px;
+    animation: spin 1s linear infinite;
+    margin: 0 auto 1rem;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+#results-container {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.result-card {
+    background-color: var(--surface-color);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1.5rem;
+}
+
+.result-card h3 {
+    margin-top: 0;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+#key-findings ul {
+    padding-left: 20px;
+    margin: 0;
+    list-style-type: none;
+}
+
+#key-findings li {
+    margin-bottom: 1rem;
+    line-height: 1.6;
+    padding-left: 1.5rem;
+    position: relative;
+}
+
+#key-findings li::before {
+    content: '■';
+    position: absolute;
+    left: 0;
+    color: var(--secondary-text-color);
+}
+
+.error {
+    border-left: 5px solid #c0392b;
+}
+
+#reset-button {
+    margin-top: 1rem;
+    background: var(--surface-color);
+    border: 1px solid var(--border-color);
+}
