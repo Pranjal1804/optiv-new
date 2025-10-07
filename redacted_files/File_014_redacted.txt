@@ -1,0 +1,36 @@
+PowerPoint Presentation - Redacted Content
+=======================================================
+
+Original file: File_014.pptx
+Total slides: 3
+Processing date: 2025-10-06 13:45:50
+
+REDACTED CONTENT:
+------------------------------
+PowerPoint Presentation Analysis:
+Total Slides: 3
+
+Slide 1:
+Network Topology Diagram
+Internal Team Reviews and Updates
+Description: This slide presents a network topology diagram, highlighting that it is currently undergoing internal team reviews and updates. Its main purpose is to show the network's structure and the ongoing process of validating and refining it.
+
+
+Slide 2:
+[Slide contains visual elements or no readable text]
+Description: Slide 2 contains primarily visual content with minimal text elements.
+
+
+Slide 3:
+Revision History
+Revision | Full Name | E<PERSON>d D<EMAIL_ADDRESS>)
+1<DATE_TIME> Thompson | sarah.thompson@cadence.com | 2023-06-01 | Initia<PERSON>etw<EMAIL_ADDRESS>am <DATE_TIME>.1 | Michael Chen | m.chen@cadence.com | 2023-12-03 | Updated IP addressing<EMAIL_ADDRESS>ent<DATE_TIME>isha Rahman | aisha.rahman@cadence.com | 2024-05-07 | No chan<PERSON>ed <EMAIL_ADDRESS>iag<DATE_TIME> Priya Desai | priya.desai@cadence.com | 2024-10-15 | No changes. Confirmed compliance with updated security policies.
+Description: This slide presents a revision history log, detailing the chronological development and approval of a document or diagram. It tracks each version, the responsible individual, date, and a summary of changes made or reviews performed, including initial drafts, technical updates, and compliance checks.
+
+
+Slide Images: 3 slides processed for visual content
+
+Slide Images Processed: 3
+- Slide 1: 2 text elements, 1 images, 0 tables, 0 charts
+- Slide 2: 0 text elements, 2 images, 0 tables, 0 charts
+- Slide 3: 1 text elements, 1 images, 1 tables, 0 charts

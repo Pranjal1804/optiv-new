@@ -1,4 +1,3 @@
-<!-- filepath: frontend/index.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15,6 +14,7 @@
         <header>
             <h1>File Cleansing and Analysis AI</h1>
             <p>Upload a file to redact sensitive information and receive a detailed analysis.</p>
+            <p><small>Supported formats: Images (PNG, JPG, JPEG), PDFs, Excel files (XLSX, XLS), PowerPoint with slide analysis (PPT, PPTX)</small></p>
         </header>
 
         <main>
@@ -23,7 +23,7 @@
                     <label for="file-input" class="file-label">
                         <span id="file-name">Click to select a file or drag and drop</span>
                     </label>
-                    <input type="file" id="file-input" name="file" required>
+                    <input type="file" id="file-input" name="file" accept=".png,.jpg,.jpeg,.pdf,.xlsx,.xls,.ppt,.pptx" required>
                     <button type="submit" id="submit-button">Analyze File</button>
                 </form>
                 <div class="spinner-container" id="spinner" style="display: none;">
@@ -45,6 +45,7 @@
                 <div class="result-card">
                     <h3>Downloads</h3>
                     <a id="download-button" class="button" download>Download Redacted File</a>
+                    <p><small>For PowerPoint files: Download includes slide-by-slide analysis and content descriptions</small></p>
                 </div>
                  <button id="reset-button" class="button">Process Another File</button>
             </div>
@@ -52,6 +53,7 @@
             <div id="error-container" class="result-card error" style="display: none;">
                 <h3>An Error Occurred</h3>
                 <p id="error-message"></p>
+                <button id="reset-button-error" class="button">Try Again</button>
             </div>
         </main>
     </div>

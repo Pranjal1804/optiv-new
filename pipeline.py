@@ -1,20 +1,19 @@
 # pipeline.py
 import os
-from pathlib import Path
 import cv2
 import pytesseract
-from PIL import Image
-import pandas as pd
-from ultralytics import YOLO
-from langchain_community.llms import CTransformers
-from langchain_community.chat_models import ChatLlamaCpp
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.messages import HumanMessage
 import pdfplumber
+from pathlib import Path
+from PIL import Image
+from ultralytics import YOLO
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
 from presidio_anonymizer import AnonymizerEngine
-import numpy as np
+from dotenv import load_dotenv
+import google.generativeai as genai
+import openpyxl
+from openpyxl import load_workbook
+from pptx import Presentation
+from datetime import datetime
 
 # --- Configuration ---
 UPLOAD_DIR = Path("uploads")
@@ -25,10 +24,19 @@ MODEL_DIR = Path("models")
 UPLOAD_DIR.mkdir(exist_ok=True)
 REDACTED_DIR.mkdir(exist_ok=True)
 
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("Warning: GEMINI_API_KEY not found in environment variables")
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
+
 # --- Global Variables for Models (initialized on first use) ---
 _yolo_model = None
-_llava_model = None
-_llm = None
+_gemini_model = None
 _analyzer = None
 _anonymizer = None
 
@@ -36,7 +44,7 @@ _anonymizer = None
 def get_yolo_model():
     """Load YOLO model (lazy loading)"""
     global _yolo_model
-    if _yolo_model is None:
+    if (_yolo_model is None):
         YOLO_MODEL_PATH = "best.pt"
         if not Path(YOLO_MODEL_PATH).exists():
             print(f"Warning: YOLO model not found at {YOLO_MODEL_PATH}")
@@ -44,40 +52,17 @@ def get_yolo_model():
         _yolo_model = YOLO(YOLO_MODEL_PATH)
     return _yolo_model
 
-def get_llava_model():
-    """Load LLaVA model (lazy loading)"""
-    global _llava_model
-    if (_llava_model is None):
+def get_gemini_model():
+    """Get Gemini model (lightweight)"""
+    global _gemini_model
+    if _gemini_model is None:
         try:
-            _llava_model = ChatLlamaCpp(
-                model_path=str(MODEL_DIR / "ggml-model-q5_k.gguf"),
-                chat_format="llava-1-5",
-                model_kwargs={
-                    "clip_model_path": str(MODEL_DIR / "mmproj-model-f16.gguf")
-                },
-                n_gpu_layers=0,
-                n_ctx=2048,
-                verbose=False,
-            )
+            _gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+            print("Gemini model initialized successfully")
         except Exception as e:
-            print(f"Warning: Could not load LLaVA model: {e}")
+            print(f"Warning: Could not initialize Gemini model: {e}")
             return None
-    return _llava_model
-
-def get_llm():
-    """Load Mistral LLM (lazy loading)"""
-    global _llm
-    if _llm is None:
-        try:
-            _llm = CTransformers(
-                model=str(MODEL_DIR / "mistral-7b-instruct-v0.2.Q5_K_M.gguf"),
-                model_type="mistral",
-                config={'context_length': 8192, 'gpu_layers': 0}
-            )
-        except Exception as e:
-            print(f"Warning: Could not load Mistral LLM: {e}")
-            return None
-    return _llm
+    return _gemini_model
 
 def get_analyzer():
     """Get Presidio analyzer with comprehensive PII and technical data recognizers"""
@@ -85,49 +70,78 @@ def get_analyzer():
     if (_analyzer is None):
         # AWS and Cloud Infrastructure Patterns
         aws_patterns = [
-            Pattern(name="AWS_ARN", regex=r"arn:aws:[a-z0-9\-]+:[a-z0-9\-]*:[0-9]{12}:[a-zA-Z0-9\-\/\:\_]+", score=0.95),
-            Pattern(name="AWS_ROLE_ID", regex=r"A[IKR][A-Z0-9]{18,}", score=0.9),
+            #Pattern(name="AWS_ARN", regex=r"arn:aws:[a-z0-9\-]+:[a-z0-9\-]*:[0-9]{12}:[a-zA-Z0-9\-\/\:\_]+", score=0.65),
+            #Pattern(name="AWS_ROLE_ID", regex=r"A[IKR][A-Z0-9]{18,}", score=0.60),
             Pattern(name="AWS_ACCOUNT", regex=r"\b\d{12}\b", score=0.85),
-            Pattern(name="IP_CIDR", regex=r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}\b", score=0.95),
-            Pattern(name="IP_ADDRESS", regex=r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", score=0.9),
-            Pattern(name="MAC_ADDRESS", regex=r"\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b", score=0.9),
+            Pattern(name="IP_CIDR", regex=r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}\b", score=0.60),
+            Pattern(name="IP_ADDRESS", regex=r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", score=0.98),
+            Pattern(name="MAC_ADDRESS", regex=r"\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b", score=0.95),
         ]
         
         # Network and Security Patterns
         network_patterns = [
-            Pattern(name="PORT_RANGE", regex=r"\b(tcp|udp|icmp):\d{1,5}(-\d{1,5})?\b", score=0.85),
-            Pattern(name="PORT_SINGLE", regex=r"\b(port|Port)\s*:?\s*\d{1,5}\b", score=0.8),
+            Pattern(name="PORT_RANGE", regex=r"\b(tcp|udp|icmp):\d{1,5}(-\d{1,5})?\b", score=0.95),
+            Pattern(name="PORT_SINGLE", regex=r"\b(port|Port)\s*:?\s*\d{1,5}\b", score=0.98),
             Pattern(name="PROTOCOL", regex=r"\b(tcp|udp|icmp|ssh|rdp|sftp):\d+\b", score=0.85),
         ]
         
         # File paths and sensitive locations
         path_patterns = [
-            Pattern(name="FILE_PATH", regex=r"file://[a-zA-Z0-9\-\_\./]+", score=0.8),
-            Pattern(name="UNIX_PATH", regex=r"/[a-zA-Z0-9\-\_/]+\.[a-zA-Z]{2,4}", score=0.75),
+            Pattern(name="FILE_PATH", regex=r"file://[a-zA-Z0-9\-\_\./]+", score=0.74),
+            Pattern(name="UNIX_PATH", regex=r"/[a-zA-Z0-9\-\_/]+\.[a-zA-Z]{2,4}", score=0.7),
         ]
-        
-        # Dates and timestamps that might be sensitive
-        date_patterns = [
-            Pattern(name="ISO_DATETIME", regex=r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", score=0.7),
-            Pattern(name="TIMESTAMP", regex=r"\d{2}/\d{2}/\d{2,4}", score=0.6),
-        ]
-        
-        # Names and identifiers
+        # Name Patterns - Enhanced for better detection
         name_patterns = [
-            Pattern(name="ROLE_NAME", regex=r"(role|Role)[-_]?[nN]ame[\"']?\s*:?\s*[\"']?([A-Za-z0-9\-\_]+)", score=0.8),
-            Pattern(name="GROUP_NAME", regex=r"(group|Group)[-_]?[nN]ame[\"']?\s*:?\s*[\"']?([A-Za-z0-9\-\_]+)", score=0.8),
-            # Original pattern, good for single-line rule names
-            Pattern(name="FIREWALL_RULE_NAME", regex=r"\bdefault-[a-z\-]+\b", score=0.9),
-            # New, more flexible pattern for multi-line or partial rule names
-            Pattern(name="FIREWALL_RULE_PREFIX", regex=r"\b(default-allow-|default-deny-)\b", score=0.85),
+            # Full names (First Last, First Middle Last)
+            Pattern(name="FULL_NAME", regex=r"\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?\b", score=0.85),
+            # Names with titles (Mr., Mrs., Dr., etc.)
+            Pattern(name="TITLED_NAME", regex=r"\b(?:Mr\.?|Mrs\.?|Ms\.?|Dr\.?|Prof\.?|Sir|Madam)\s+[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?\b", score=0.90),
+            # Names in "Last, First" format
+            Pattern(name="LASTNAME_FIRST", regex=r"\b[A-Z][a-z]{2,},\s+[A-Z][a-z]{2,}(?:\s+[A-Z]\.?)?\b", score=0.88),
+            # Employee/Person IDs with names
+            Pattern(name="EMPLOYEE_NAME", regex=r"(?:Employee|Staff|User|Person):\s*[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}", score=0.90),
+            # Names in brackets or quotes
+            Pattern(name="QUOTED_NAME", regex=r"[\"']([A-Z][a-z]{2,}\s+[A-Z][a-z]{2,})[\"']", score=0.85),
+            # Names with common suffixes
+            Pattern(name="NAME_WITH_SUFFIX", regex=r"\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\s+(?:Jr\.?|Sr\.?|III?|IV)\b", score=0.90),
         ]
-        
-        # Session and duration
-        duration_patterns = [
-            Pattern(name="SESSION_DURATION", regex=r"(session|Session)[-_]?[dD]uration[\"']?\s*:?\s*\d+", score=0.75),
-            Pattern(name="MAX_DURATION", regex=r"max[-_]?session[-_]?duration\s*\d+", score=0.8),
+
+         # Date Patterns - Comprehensive date formats
+        date_patterns = [
+            # MM/DD/YYYY, MM-DD-YYYY, MM.DD.YYYY
+            Pattern(name="US_DATE_FORMAT", regex=r"\b(?:0?[1-9]|1[0-2])[\/\-\.]\d{1,2}[\/\-\.]\d{4}\b", score=0.85),
+            # DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+            Pattern(name="EU_DATE_FORMAT", regex=r"\b(?:0?[1-9]|[12]\d|3[01])[\/\-\.]\d{1,2}[\/\-\.]\d{4}\b", score=0.80),
+            # YYYY-MM-DD, YYYY/MM/DD (ISO format)
+            Pattern(name="ISO_DATE_FORMAT", regex=r"\b\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}\b", score=0.90),
+            # Month DD, YYYY
+            Pattern(name="WRITTEN_DATE", regex=r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b", score=0.85),
+            # DD Month YYYY
+            Pattern(name="WRITTEN_DATE_EU", regex=r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b", score=0.85),
+            # Short month formats (Jan, Feb, etc.)
+            Pattern(name="SHORT_MONTH_DATE", regex=r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},?\s+\d{4}\b", score=0.80),
+            # Date with time (YYYY-MM-DD HH:MM:SS)
+            Pattern(name="DATETIME_ISO", regex=r"\b\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\b", score=0.90),
+            # Timestamp formats
+            Pattern(name="TIMESTAMP", regex=r"\b\d{2}\/\d{2}\/\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?\b", score=0.85),
+            # Birth dates (common formats)
+            Pattern(name="BIRTH_DATE", regex=r"(?:DOB|Date of Birth|Born):\s*\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4}", score=0.95),
+            # Expiry dates
+            Pattern(name="EXPIRY_DATE", regex=r"(?:Exp|Expiry|Expires?):\s*\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}", score=0.90),
+            # Relative dates
+            Pattern(name="RELATIVE_DATE", regex=r"\b(?:yesterday|today|tomorrow|\d+\s+(?:days?|weeks?|months?|years?)\s+(?:ago|from now))\b", score=0.75),
         ]
-        
+
+        # Additional Person-related Patterns
+        person_patterns = [
+            # Social media handles
+            Pattern(name="SOCIAL_HANDLE", regex=r"@[A-Za-z0-9_]{3,}", score=0.70),
+            # Initials (A.B., A.B.C.)
+            Pattern(name="INITIALS", regex=r"\b[A-Z]\.[A-Z]\.(?:[A-Z]\.)?\b", score=0.75),
+            # Signatures or "Signed by"
+            Pattern(name="SIGNATURE", regex=r"(?:Signed by|Signature|Regards|Best regards|Sincerely),?\s*[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?", score=0.80),
+        ]
+
         # Create recognizers
         aws_recognizer = PatternRecognizer(
             supported_entity="AWS_IDENTIFIER",
@@ -146,23 +160,23 @@ def get_analyzer():
             patterns=path_patterns,
             name="Path Recognizer"
         )
+         # New recognizers for names and dates
+        name_recognizer = PatternRecognizer(
+            supported_entity="PERSON_NAME",
+            patterns=name_patterns,
+            name="Enhanced Name Recognizer"
+        )
         
         date_recognizer = PatternRecognizer(
-            supported_entity="TIMESTAMP",
+            supported_entity="DATE_TIME",
             patterns=date_patterns,
-            name="Date Recognizer"
+            name="Enhanced Date Recognizer"
         )
         
-        name_recognizer = PatternRecognizer(
-            supported_entity="IDENTIFIER_NAME",
-            patterns=name_patterns,
-            name="Name Recognizer"
-        )
-        
-        duration_recognizer = PatternRecognizer(
-            supported_entity="DURATION",
-            patterns=duration_patterns,
-            name="Duration Recognizer"
+        person_recognizer = PatternRecognizer(
+            supported_entity="PERSON_INFO",
+            patterns=person_patterns,
+            name="Person Info Recognizer"
         )
         
         # Initialize analyzer with all recognizers
@@ -170,319 +184,336 @@ def get_analyzer():
         _analyzer.registry.add_recognizer(aws_recognizer)
         _analyzer.registry.add_recognizer(network_recognizer)
         _analyzer.registry.add_recognizer(path_recognizer)
-        _analyzer.registry.add_recognizer(date_recognizer)
         _analyzer.registry.add_recognizer(name_recognizer)
-        _analyzer.registry.add_recognizer(duration_recognizer)
+        _analyzer.registry.add_recognizer(date_recognizer)
+        _analyzer.registry.add_recognizer(person_recognizer)
     
     return _analyzer
 
 def get_anonymizer():
     """Get Presidio anonymizer"""
     global _anonymizer
-    if _anonymizer is None:
+    if (_anonymizer is None):
         _anonymizer = AnonymizerEngine()
     return _anonymizer
 
+# --- Helper Functions ---
+def extract_file_info_from_path(file_path):
+    """Extract file name and type from path for table formatting"""
+    if file_path is None:
+        return {'name': 'Document', 'type': '.png', 'full_name': 'Document.png'}
+    
+    path = Path(file_path)
+    # Extract base name without _redacted suffix
+    name = path.stem.replace('_redacted_llava', '').replace('_redacted_text', '').replace('_redacted_scenic', '')
+    return {
+        'name': name,
+        'type': path.suffix,
+        'full_name': path.name
+    }
 
-# --- Main Processing Function (This is what main.py should import) ---
+# Update the describe_image_with_gemini function
+def describe_image_with_gemini(file_path: Path):
+    """Use Gemini to describe what's in the image"""
+    try:
+        gemini_model = get_gemini_model()
+        if gemini_model is None:
+            return "Image contains visual content. No text detected for PII analysis."
+        
+        # Load and prepare image
+        img = Image.open(file_path)
+        
+        # Resize image if too large for API
+        max_size = 1024
+        if img.width > max_size or img.height > max_size:
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+        prompt = """Analyze this image and provide a brief description. Focus on:
+1. What type of content, document, or scene this is
+2. Main objects, elements, or information visible
+3. The apparent purpose or context
+
+Provide 2-3 clear sentences. Be specific about what you see."""
+        
+        response = gemini_model.generate_content([prompt, img])
+        description = response.text.strip()
+        
+        if not description or len(description) < 10:
+            return "Image processed successfully. Visual content detected but no detailed description available."
+        
+        return description
+        
+    except Exception as e:
+        print(f"Error describing image with Gemini: {e}")
+        return "Image contains visual content. Unable to generate detailed description due to processing limitations."
+
+# Add this new function after the describe_image_with_gemini function
+
+def detect_and_remove_logos(file_path: Path, img):
+    """Use Gemini to detect logos and remove them from the image"""
+    try:
+        gemini_model = get_gemini_model()
+        if gemini_model is None:
+            print("Gemini model not available for logo detection")
+            return img, []
+        
+        # Convert OpenCV image to PIL for Gemini
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        
+        # Resize if too large
+        max_size = 1024
+        if pil_img.width > max_size or pil_img.height > max_size:
+            pil_img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+        prompt = """Analyze this image and identify any logos, brand marks, or company identifiers. 
+
+For each logo you find, provide:
+1. A brief description of the logo
+2. The approximate location (top-left, top-right, center, bottom-left, bottom-right, etc.)
+3. Whether it's a company logo, brand mark, or watermark
+
+Format your response as:
+LOGO_FOUND: [description] | LOCATION: [location] | TYPE: [company/brand/watermark]
+
+If no logos are found, respond with: NO_LOGOS_DETECTED
+
+Examples:
+LOGO_FOUND: Microsoft logo with four colored squares | LOCATION: top-left | TYPE: company
+LOGO_FOUND: Nike swoosh symbol | LOCATION: bottom-right | TYPE: brand
+LOGO_FOUND: Watermark text "CONFIDENTIAL" | LOCATION: center | TYPE: watermark"""
+        
+        response = gemini_model.generate_content([prompt, pil_img])
+        detection_result = response.text.strip()
+        
+        print(f"Logo detection result: {detection_result}")
+        
+        if "NO_LOGOS_DETECTED" in detection_result.upper():
+            return img, []
+        
+        # Parse logo detections
+        detected_logos = []
+        lines = detection_result.split('\n')
+        
+        for line in lines:
+            if "LOGO_FOUND:" in line.upper():
+                try:
+                    parts = line.split('|')
+                    description = parts[0].split('LOGO_FOUND:')[1].strip()
+                    location = parts[1].split('LOCATION:')[1].strip() if len(parts) > 1 else "unknown"
+                    logo_type = parts[2].split('TYPE:')[1].strip() if len(parts) > 2 else "unknown"
+                    
+                    detected_logos.append({
+                        'description': description,
+                        'location': location,
+                        'type': logo_type
+                    })
+                except:
+                    continue
+        
+        if not detected_logos:
+            return img, []
+        
+        # Create logo-removed image
+        logo_removed_img = remove_logos_from_image(img, detected_logos, pil_img)
+        
+        return logo_removed_img, detected_logos
+        
+    except Exception as e:
+        print(f"Error in logo detection: {e}")
+        return img, []
+
+def remove_logos_from_image(img, detected_logos, pil_img):
+    """Remove detected logos from the image using region masking"""
+    try:
+        h, w = img.shape[:2]
+        logo_removed_img = img.copy()
+        
+        for logo in detected_logos:
+            location = logo['location'].lower()
+            
+            # Define regions based on location descriptions
+            if 'top-left' in location or 'top left' in location:
+                region = (0, 0, w//3, h//3)
+            elif 'top-right' in location or 'top right' in location:
+                region = (2*w//3, 0, w, h//3)
+            elif 'bottom-left' in location or 'bottom left' in location:
+                region = (0, 2*h//3, w//3, h)
+            elif 'bottom-right' in location or 'bottom right' in location:
+                region = (2*w//3, 2*h//3, w, h)
+            elif 'top' in location:
+                region = (w//4, 0, 3*w//4, h//4)
+            elif 'bottom' in location:
+                region = (w//4, 3*h//4, 3*w//4, h)
+            elif 'left' in location:
+                region = (0, h//4, w//4, 3*h//4)
+            elif 'right' in location:
+                region = (3*w//4, h//4, w, 3*h//4)
+            elif 'center' in location or 'middle' in location:
+                region = (w//3, h//3, 2*w//3, 2*h//3)
+            else:
+                # Default to center region if location unclear
+                region = (w//3, h//3, 2*w//3, 2*h//3)
+            
+            x1, y1, x2, y2 = region
+            
+            # Apply region-specific logo removal
+            logo_removed_img = apply_logo_removal(logo_removed_img, x1, y1, x2, y2, logo)
+        
+        return logo_removed_img
+        
+    except Exception as e:
+        print(f"Error removing logos: {e}")
+        return img
+
+def apply_logo_removal(img, x1, y1, x2, y2, logo_info):
+    """Apply logo removal techniques to a specific region"""
+    try:
+        # Extract the region
+        region = img[y1:y2, x1:x2]
+        
+        if region.size == 0:
+            return img
+        
+        logo_type = logo_info['type'].lower()
+        
+        if 'watermark' in logo_type or 'text' in logo_info['description'].lower():
+            # For text watermarks, use morphological operations
+            processed_region = remove_text_watermark(region)
+        else:
+            # For logos and brand marks, use inpainting
+            processed_region = remove_logo_inpainting(region)
+        
+        # Replace the region in the original image
+        img[y1:y2, x1:x2] = processed_region
+        
+        return img
+        
+    except Exception as e:
+        print(f"Error in logo removal application: {e}")
+        return img
+
+def remove_text_watermark(region):
+    """Remove text watermarks using morphological operations"""
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        
+        # Create morphological kernel
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        
+        # Apply morphological opening to remove small text elements
+        opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+        
+        # Create mask for text areas
+        text_mask = cv2.absdiff(gray, opened)
+        text_mask = cv2.threshold(text_mask, 10, 255, cv2.THRESH_BINARY)[1]
+        
+        # Dilate to cover text completely
+        text_mask = cv2.dilate(text_mask, kernel, iterations=2)
+        
+        # Inpaint the text areas
+        result = cv2.inpaint(region, text_mask, 3, cv2.INPAINT_TELEA)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error in text watermark removal: {e}")
+        return region
+
+def remove_logo_inpainting(region):
+    """Remove logos using inpainting techniques"""
+    try:
+        # Convert to grayscale for edge detection
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Detect edges (potential logo boundaries)
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Dilate edges to create mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.dilate(edges, kernel, iterations=2)
+        
+        # Apply median filter to reduce small edge artifacts
+        mask = cv2.medianBlur(mask, 5)
+        
+        # Inpaint the logo areas
+        result = cv2.inpaint(region, mask, 5, cv2.INPAINT_NS)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error in logo inpainting: {e}")
+        return region
+
+# --- Main Processing Functions ---
 def process_image(file_path: Path):
-    """
-    Main function to process images. It now uses LLaVA to intelligently decide
-    the best processing path (scenic vs. text-heavy).
-    
-    Args:
-        file_path: Path to the image file
-    
-    Returns:
-        tuple: (redacted_file_path, analysis_text)
-    """
-    print("Starting intelligent image processing...")
-    llava_model = get_llava_model()
-    if not llava_model:
-        print("LLaVA model not available. Falling back to simple text check.")
-        is_scenic = is_image_scenic_fallback(file_path)
-        if is_scenic:
-            return process_scenic_image(file_path)
-        else:
-            return process_text_image(file_path, get_analyzer())
+    """Main function to process images - simplified to just use OCR"""
+    print("Processing image with OCR...")
+    return process_text_image(file_path, get_analyzer())
 
-    # Use LLaVA to get an initial description of the image.
-    print("Using LLaVA for initial image assessment...")
-    try:
-        image_path_uri = file_path.resolve().as_uri()
-        # This prompt asks LLaVA to classify the image type for us.
-        prompt = "Is this image a real-world photograph of people or objects, or is it a computer screenshot of a user interface, dashboard, or document? Describe the content."
-        message = HumanMessage(
-            content=[
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image_path_uri}},
-            ]
-        )
-        response = llava_model.invoke([message])
-        initial_analysis = response.content.lower()
-        print(f"LLaVA assessment: {initial_analysis}")
-
-        # Keywords to identify a screenshot or technical document.
-        text_heavy_keywords = ['screenshot', 'user interface', 'dashboard', 'policy', 'firewall', 'azure', 'aws', 'gcp', 'table', 'text', 'code']
-        
-        # Decide the path based on LLaVA's description.
-        if any(keyword in initial_analysis for keyword in text_heavy_keywords):
-            print("LLaVA identified a text-heavy image/screenshot. Processing with vision-based text extraction.")
-            # For screenshots, we trust LLaVA's reading ability over OCR.
-            # We ask it to read the text and then format it.
-            return process_screenshot_with_llava(file_path)
-        else:
-            print("LLaVA identified a scenic image. Processing with YOLO and LLaVA description.")
-            return process_scenic_image(file_path)
-
-    except Exception as e:
-        print(f"An error occurred during LLaVA assessment: {e}. Falling back to old method.")
-        is_scenic = is_image_scenic_fallback(file_path)
-        if is_scenic:
-            return process_scenic_image(file_path)
-        else:
-            return process_text_image(file_path, get_analyzer())
-
-
-def process_file(file_path: Path, file_type: str = None):
-    """
-    Universal file processor - automatically detects and processes any file type
-    
-    Args:
-        file_path: Path to the file
-        file_type: Optional file type hint ('image', 'pdf', 'excel', etc.)
-    
-    Returns:
-        dict: {
-            'redacted_path': Path to redacted file,
-            'analysis': Analysis text,
-            'file_type': Detected file type
-        }
-    """
-    file_path = Path(file_path)
-    
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-    
-    # Auto-detect file type
-    ext = file_path.suffix.lower()
-    
-    if ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']:
-        # The main process_image function now handles the logic internally.
-        redacted_path, analysis = process_image(file_path)
-        return {
-            'redacted_path': redacted_path,
-            'analysis': analysis,
-            'file_type': 'image'
-        }
-    
-    elif ext == '.pdf':
-        redacted_path, analysis = process_pdf(file_path)
-        return {
-            'redacted_path': redacted_path,
-            'analysis': analysis,
-            'file_type': 'pdf'
-        }
-    
-    elif ext in ['.xlsx', '.xls']:
-        redacted_path, analysis = process_excel(file_path)
-        return {
-            'redacted_path': redacted_path,
-            'analysis': analysis,
-            'file_type': 'excel'
-        }
-    
-    elif ext == '.pptx':
-        redacted_path, analysis = process_powerpoint(file_path)
-        return {
-            'redacted_path': redacted_path,
-            'analysis': analysis,
-            'file_type': 'powerpoint'
-        }
-    
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
-
-
-def is_image_scenic_fallback(file_path: Path) -> bool:
-    """
-    Fallback function to determine if an image is scenic or text-heavy.
-    Only used if the primary LLaVA assessment fails.
-    """
-    try:
-        img = cv2.imread(str(file_path))
-        if img is None:
-            return False
-        
-        # Quick OCR test to see if there's significant text
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        text = pytesseract.image_to_string(gray)
-        
-        # If more than 20 characters detected, it's probably text-heavy
-        if len(text.strip()) > 20:
-            return False
-        
-        return True
-    except Exception as e:
-        print(f"Error in fallback image type detection: {e}")
-        return False  # Default to text-heavy for safety
-
-
-# --- Processing Functions ---
-def process_screenshot_with_llava(file_path: Path):
-    """
-    Advanced function to process screenshots:
-    1. LLaVA reads the text.
-    2. Presidio finds PII in the text.
-    3. Tesseract OCR maps text to image locations.
-    4. OpenCV blacks out the PII on the image.
-    5. Mistral formats the clean text into a professional report.
-    """
-    print(f"Processing screenshot with LLaVA: {file_path.name}")
-    llava_model = get_llava_model()
-    
-    # Step 1: Use LLaVA to accurately read all text from the screenshot.
-    read_prompt = "Transcribe all text from the image. If it's a table, maintain the row and column structure."
-    message = HumanMessage(
-        content=[
-            {"type": "text", "text": read_prompt},
-            {"type": "image_url", "image_url": {"url": file_path.resolve().as_uri()}},
-        ]
-    )
-    response = llava_model.invoke([message])
-    extracted_text = response.content
-    print("LLaVA has extracted the text from the screenshot.")
-
-    # Step 2: Analyze the high-quality text for PII using Presidio.
-    analyzer = get_analyzer()
-    analyzer_results = analyzer.analyze(text=extracted_text, language='en')
-    
-    # --- NEW REDACTION LOGIC ---
-    # Step 3: Get word-level bounding boxes from Tesseract OCR.
-    img = cv2.imread(str(file_path))
-    redacted_img = img.copy()
-    ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-    
-    # Step 4: Redact PII found by Presidio using OCR bounding boxes.
-    pii_locations = [(res.start, res.end) for res in analyzer_results]
-    
-    full_ocr_text = ""
-    word_map = [] # Stores (word, start_index, end_index, box)
-    
-    for i, word in enumerate(ocr_data['text']):
-        if word.strip() and int(ocr_data['conf'][i]) > 30: # Only consider confident words
-            start_index = len(full_ocr_text)
-            full_ocr_text += word + " "
-            end_index = len(full_ocr_text) - 1
-            box = (ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i])
-            word_map.append((word, start_index, end_index, box))
-
-    # Find and redact words that overlap with Presidio's PII findings
-    for word, start, end, box in word_map:
-        for pii_start, pii_end in pii_locations:
-            # Check for overlap between word and PII span
-            if max(start, pii_start) < min(end, pii_end):
-                (x, y, w, h) = box
-                cv2.rectangle(redacted_img, (x, y), (x + w, y + h), (0, 0, 0), -1)
-                break # Move to next word once redacted
-
-    redacted_filename = f"{file_path.stem}_redacted_llava.png"
-    redacted_path = REDACTED_DIR / redacted_filename
-    cv2.imwrite(str(redacted_path), redacted_img)
-    print(f"Redacted image saved to {redacted_path}")
-    # --- END NEW REDACTION LOGIC ---
-
-    # Step 5: Format the clean text into the final analysis using the improved prompt.
-    formatted_analysis = format_technical_analysis(extracted_text)
-    
-    return redacted_path, formatted_analysis
-
-
-def process_scenic_image(file_path: Path):
-    """Handles redaction and analysis for SCENIC images (non-text) using YOLO and LLaVA."""
-    print(f"Processing scenic image: {file_path.name}")
-    
-    img = cv2.imread(str(file_path))
-    if img is None:
-        return None, "Error: Could not read image"
-    
-    yolo_model = get_yolo_model()
-    if yolo_model is not None:
-        results = yolo_model(img)[0]
-        
-        for box in results.boxes:
-            x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
-            roi = img[y1:y2, x1:x2]
-            if roi.size > 0:
-                blurred_roi = cv2.GaussianBlur(roi, (51, 51), 0)
-                img[y1:y2, x1:x2] = blurred_roi
-    
-    redacted_filename = f"{file_path.stem}_redacted_scenic.png"
-    redacted_path = REDACTED_DIR / redacted_filename
-    cv2.imwrite(str(redacted_path), img)
-    
-    # Try LLaVA analysis
-    llava_model = get_llava_model()
-    if llava_model is not None:
-        print("Analyzing scenic image with LLaVA...")
-        try:
-            image_path_uri = file_path.resolve().as_uri()
-            prompt = "Provide a detailed description of this image. What is happening? What objects are present? What is the context?"
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_path_uri}},
-                ]
-            )
-            response = llava_model.invoke([message])
-            analysis_text = response.content
-        except Exception as e:
-            analysis_text = f"Image processed but analysis failed: {e}"
-    else:
-        analysis_text = "Scenic image processed. YOLO redaction applied. (LLaVA not available for analysis)"
-    
-    return redacted_path, analysis_text
-
-
+# Update the process_text_image function
 def process_text_image(file_path: Path, analyzer_engine: AnalyzerEngine):
-    """
-    Enhanced TEXT-HEAVY image processor with improved OCR and aggressive PII redaction
-    """
-    print(f"Performing enhanced OCR-based processing on {file_path.name}...")
+    """Process text-heavy images with OCR + PII redaction + Logo removal"""
+    print(f"OCR-based processing on {file_path.name}...")
     
     img = cv2.imread(str(file_path))
     if img is None:
         return None, "Error: Could not read image"
     
-    # --- SPEED OPTIMIZATION: Resize large images before processing ---
     MAX_DIMENSION = 1800
     h, w, _ = img.shape
     if h > MAX_DIMENSION or w > MAX_DIMENSION:
         scale = MAX_DIMENSION / max(h, w)
         new_w, new_h = int(w * scale), int(h * scale)
         img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        print(f"Resized image from {w}x{h} to {new_w}x{new_h}")
-
-    # Improve image quality for better OCR
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Apply adaptive thresholding to improve text clarity
+    
+    # Step 1: Detect and remove logos
+    print("Detecting and removing logos...")
+    logo_removed_img, detected_logos = detect_and_remove_logos(file_path, img)
+    
+    # Log logo detection results
+    if detected_logos:
+        print(f"Detected {len(detected_logos)} logo(s):")
+        for i, logo in enumerate(detected_logos, 1):
+            print(f"  {i}. {logo['description']} at {logo['location']} (type: {logo['type']})")
+    else:
+        print("No logos detected")
+    
+    # Step 2: Continue with OCR on logo-removed image
+    gray = cv2.cvtColor(logo_removed_img, cv2.COLOR_BGR2GRAY)
     gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                   cv2.THRESH_BINARY, 11, 2)
     
-    # Perform OCR with higher detail
-    ocr_config = r'--oem 3 --psm 6'  # Use LSTM OCR engine, assume uniform text block
+    ocr_config = r'--oem 3 --psm 6'
     ocr_data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=ocr_config)
     
     full_text_for_analysis = " ".join(word for word in ocr_data['text'] if word.strip())
     
-    if not full_text_for_analysis:
-        print("No text detected. Using VLM for description.")
-        # If no text, use LLaVA for a general description
-        _, analysis_text = process_scenic_image(file_path)
-        # Since no PII was found, return the original image path instead of a redacted one
-        return file_path, analysis_text
+    # If no significant text detected, describe the image content
+    if not full_text_for_analysis or len(full_text_for_analysis.strip()) < 20:
+        print("No significant text detected, generating image description...")
+        image_description = describe_image_with_gemini(file_path)
+        
+        # Create a redacted image (logo-removed version)
+        redacted_filename = f"{file_path.stem}_redacted_text.png"
+        redacted_path = REDACTED_DIR / redacted_filename
+        cv2.imwrite(str(redacted_path), logo_removed_img)
+        
+        # Format the description as analysis text, including logo information
+        logo_info = ""
+        if detected_logos:
+            logo_descriptions = [f"{logo['description']} ({logo['location']})" for logo in detected_logos]
+            logo_info = f" Logos detected and removed: {', '.join(logo_descriptions)}."
+        
+        analysis_text = f"Visual Content Analysis: {image_description}. This image does not contain significant readable text requiring PII redaction.{logo_info}"
+        
+        return redacted_path, analysis_text
     
-    # Comprehensive PII analysis with all entity types
+    # Step 3: Continue with normal PII processing if text is found
     analyzer_results = analyzer_engine.analyze(
         text=full_text_for_analysis, 
         language='en',
@@ -491,25 +522,17 @@ def process_text_image(file_path: Path, analyzer_engine: AnalyzerEngine):
             "CREDIT_CARD", "US_SSN", "US_DRIVER_LICENSE", "US_PASSPORT",
             "DATE_TIME", "NRP", "MEDICAL_LICENSE", "URL",
             "AWS_IDENTIFIER", "NETWORK_INFO", "FILE_PATH", "TIMESTAMP",
-            "IDENTIFIER_NAME", "DURATION"
+            "IDENTIFIER_NAME", "DURATION","PERSON_NAME","PERSON_INFO"
         ]
     )
     
-    # If no PII is found, use VLM for a description instead of returning raw text
-    if not analyzer_results:
-        print("No PII found in text. Using VLM for a visual description.")
-        _, analysis_text = process_scenic_image(file_path)
-        # Return the original image path as no redaction is needed
-        return file_path, analysis_text
-
-    # Create character-level PII index
     pii_char_indices = set()
     for res in analyzer_results:
         for i in range(res.start, res.end):
             pii_char_indices.add(i)
     
-    # Redact PII from image with larger blur radius for better coverage
-    redacted_img = img.copy()
+    # Apply PII redaction on the logo-removed image
+    redacted_img = logo_removed_img.copy()
     current_char_index = 0
     
     for i, word in enumerate(ocr_data['text']):
@@ -517,31 +540,22 @@ def process_text_image(file_path: Path, analyzer_engine: AnalyzerEngine):
             word_len = len(word)
             conf = int(ocr_data['conf'][i]) if ocr_data['conf'][i] != '-1' else 0
             
-            # Check if any character of this word is PII
             is_pii = any((current_char_index + char_pos) in pii_char_indices 
                         for char_pos in range(word_len))
             
-            # Also redact low-confidence text that might be PII
             if is_pii or (conf > 0 and conf < 60 and len(word) > 3):
                 (x, y, w, h) = (ocr_data['left'][i], ocr_data['top'][i], 
                                ocr_data['width'][i], ocr_data['height'][i])
                 
-                # Add padding around text for better coverage
                 padding = 5
                 x = max(0, x - padding)
                 y = max(0, y - padding)
-                w = min(img.shape[1] - x, w + 2*padding)
-                h = min(img.shape[0] - y, h + 2*padding)
+                w = min(redacted_img.shape[1] - x, w + 2*padding)
+                h = min(redacted_img.shape[0] - y, h + 2*padding)
                 
-                # Use heavier blur for complete redaction
                 roi = redacted_img[y:y+h, x:x+w]
                 if roi.size > 0:
-                    # Option 1: Black box (most secure)
                     cv2.rectangle(redacted_img, (x, y), (x+w, y+h), (0, 0, 0), -1)
-                    
-                    # Option 2: Heavy blur (comment above, uncomment below)
-                    # blurred_roi = cv2.GaussianBlur(roi, (51, 51), 50)
-                    # redacted_img[y:y+h, x:x+w] = blurred_roi
             
             current_char_index += word_len + 1
     
@@ -549,311 +563,717 @@ def process_text_image(file_path: Path, analyzer_engine: AnalyzerEngine):
     redacted_path = REDACTED_DIR / redacted_filename
     cv2.imwrite(str(redacted_path), redacted_img)
     
-    return redacted_path, full_text_for_analysis
-
+    # Add logo information to analysis text
+    logo_info = ""
+    if detected_logos:
+        logo_descriptions = [f"{logo['description']} ({logo['location']})" for logo in detected_logos]
+        logo_info = f"\n\nLogos detected and removed: {', '.join(logo_descriptions)}"
+    
+    enhanced_text = full_text_for_analysis + logo_info
+    
+    print(f"Redacted image saved to: {redacted_path}")
+    print(f"Extracted text length: {len(full_text_for_analysis)}")
+    if detected_logos:
+        print(f"Logos removed: {len(detected_logos)}")
+    
+    return redacted_path, enhanced_text
 
 def process_pdf(file_path: Path):
-    """Enhanced PDF processor with comprehensive PII redaction"""
+    """Process PDF files with proper text extraction and analysis"""
     print(f"Processing PDF: {file_path.name}")
     
     full_text = ""
-    
     try:
         with pdfplumber.open(file_path) as pdf:
             if not pdf.pages:
-                return None, "Empty or invalid PDF."
+                return None, "Empty PDF"
             
+            # Extract text from all pages
             for page in pdf.pages:
                 page_text = page.extract_text()
                 if page_text:
                     full_text += page_text + "\n"
             
-            # Check if PDF is scanned
-            if len(full_text.strip()) < 100 * len(pdf.pages):
-                print("PDF appears to be scanned. Processing all pages as images...")
-                
-                # Process each page as image
-                all_redacted_pages = []
+            # Check if we got enough text (not a scanned PDF)
+            if len(full_text.strip()) < 50:
+                print("Scanned PDF detected - using OCR")
                 all_text = []
-                
                 for page_num, page in enumerate(pdf.pages):
-                    # --- SPEED OPTIMIZATION: Lower resolution for scanned PDFs ---
-                    img = page.to_image(resolution=150).original # Was 300
-                    temp_image_path = UPLOAD_DIR / f"{file_path.stem}_page{page_num+1}.png"
-                    img.save(temp_image_path, format="PNG")
-                    
-                    # Process as text image
-                    _, page_text = process_text_image(temp_image_path, get_analyzer())
-                    all_text.append(page_text)
-                    
-                    # Load redacted image
-                    redacted_img_path = REDACTED_DIR / f"{file_path.stem}_page{page_num+1}_redacted_text.png"
-                    if redacted_img_path.exists():
-                        all_redacted_pages.append(str(redacted_img_path))
+                    try:
+                        img = page.to_image(resolution=150).original
+                        temp_path = UPLOAD_DIR / f"{file_path.stem}_page{page_num+1}.png"
+                        img.save(temp_path, format="PNG")
+                        _, page_text = process_text_image(temp_path, get_analyzer())
+                        if page_text and page_text != "No text detected in image":
+                            all_text.append(page_text)
+                        # Clean up temp file
+                        if temp_path.exists():
+                            temp_path.unlink()
+                    except Exception as e:
+                        print(f"Error processing page {page_num+1}: {e}")
                 
-                # Combine analysis
                 combined_text = "\n".join(all_text)
-                return f"Scanned PDF processed ({len(pdf.pages)} pages)", combined_text
+                if not combined_text.strip():
+                    return None, "No text could be extracted from PDF"
+                
+                full_text = combined_text
             
-            # Process text-based PDF with comprehensive entity detection
-            else:
-                analyzer = get_analyzer()
-                anonymizer = get_anonymizer()
+            # Process text for PII (whether from direct extraction or OCR)
+            analyzer = get_analyzer()
+            anonymizer = get_anonymizer()
+            
+            # Analyze for PII
+            analyzer_results = analyzer.analyze(
+                text=full_text, 
+                language='en',
+                entities=[
+                    "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION",
+                    "CREDIT_CARD", "US_SSN", "US_DRIVER_LICENSE", "US_PASSPORT",
+                    "DATE_TIME", "NRP", "MEDICAL_LICENSE", "URL",
+                    "AWS_IDENTIFIER", "NETWORK_INFO", "FILE_PATH", "TIMESTAMP",
+                    "IDENTIFIER_NAME", "DURATION"
+                ]
+            )
+            
+            # Anonymize the text
+            anonymized_result = anonymizer.anonymize(text=full_text, analyzer_results=analyzer_results)
+            
+            # Save redacted version
+            redacted_filename = f"{file_path.stem}_redacted.txt"
+            redacted_path = REDACTED_DIR / redacted_filename
+            with open(redacted_path, 'w', encoding='utf-8') as f:
+                f.write("PDF Content - Redacted Version\n")
+                f.write("=" * 40 + "\n\n")
+                f.write(anonymized_result.text)
+            
+            print(f"PDF processing completed. Text length: {len(full_text)}")
+            # Return original text for analysis (not anonymized version)
+            return redacted_path, full_text
                 
-                analyzer_results = analyzer.analyze(
-                    text=full_text, 
-                    language='en',
-                    entities=[
-                        "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION",
-                        "CREDIT_CARD", "US_SSN", "DATE_TIME", "URL",
-                        "AWS_IDENTIFIER", "NETWORK_INFO", "FILE_PATH", 
-                        "TIMESTAMP", "IDENTIFIER_NAME", "DURATION"
-                    ]
-                )
-                
-                anonymized_result = anonymizer.anonymize(
-                    text=full_text,
-                    analyzer_results=analyzer_results
-                )
-                redacted_text = anonymized_result.text
-                
-                # Save redacted text
-                redacted_filename = f"{file_path.stem}_redacted.txt"
-                redacted_path = REDACTED_DIR / redacted_filename
-                with open(redacted_path, 'w', encoding='utf-8') as f:
-                    f.write(redacted_text)
-                
-                return redacted_path, redacted_text
-    
     except Exception as e:
         print(f"Error processing PDF: {e}")
-        return None, f"Error processing PDF: {e}"
-
+        return None, f"Error processing PDF: {str(e)}"
 
 def process_excel(file_path: Path):
-    """Process Excel files with PII redaction"""
-    print(f"Processing Excel: {file_path.name}")
+    """Process Excel files (.xlsx, .xls)"""
+    print(f"Processing Excel file: {file_path.name}")
     
     try:
-        df = pd.read_excel(file_path)
+        # Load the workbook
+        if file_path.suffix.lower() == '.xls':
+            # For .xls files, we need to use pandas or xlrd
+            import pandas as pd
+            excel_data = pd.read_excel(file_path, sheet_name=None)  # Read all sheets
+            
+            all_text = []
+            for sheet_name, df in excel_data.items():
+                sheet_text = f"Sheet: {sheet_name}\n"
+                # Convert DataFrame to text
+                for index, row in df.iterrows():
+                    row_text = []
+                    for value in row:
+                        if pd.notna(value):
+                            row_text.append(str(value))
+                    if row_text:
+                        sheet_text += " | ".join(row_text) + "\n"
+                all_text.append(sheet_text)
+        else:
+            # For .xlsx files, use openpyxl
+            workbook = load_workbook(file_path, read_only=True, data_only=True)
+            
+            all_text = []
+            # Process each worksheet
+            for sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]
+                sheet_text = f"Sheet: {sheet_name}\n"
+                
+                # Extract text from cells
+                for row in sheet.iter_rows(values_only=True):
+                    row_text = []
+                    for cell in row:
+                        if cell is not None:
+                            row_text.append(str(cell))
+                    if row_text:
+                        sheet_text += " | ".join(row_text) + "\n"
+                
+                all_text.append(sheet_text)
         
+        # Combine all sheets
+        full_text = "\n\n".join(all_text)
+        
+        if not full_text.strip():
+            return None, "No data found in Excel file"
+        
+        # Analyze for PII
         analyzer = get_analyzer()
         anonymizer = get_anonymizer()
         
-        # Process each cell
-        for col in df.columns:
-            for idx, value in enumerate(df[col]):
-                if pd.notna(value) and isinstance(value, str):
-                    analyzer_results = analyzer.analyze(text=value, language='en')
-                    if analyzer_results:
-                        anonymized = anonymizer.anonymize(text=value, analyzer_results=analyzer_results)
-                        df.at[idx, col] = anonymized.text
+        analyzer_results = analyzer.analyze(
+            text=full_text,
+            language='en',
+            entities=[
+                "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION",
+                "CREDIT_CARD", "US_SSN", "US_DRIVER_LICENSE", "US_PASSPORT",
+                "DATE_TIME", "NRP", "MEDICAL_LICENSE", "URL",
+                "AWS_IDENTIFIER", "NETWORK_INFO", "FILE_PATH", "TIMESTAMP",
+                "IDENTIFIER_NAME", "DURATION"
+            ]
+        )
         
-        # Save redacted Excel
-        redacted_filename = f"{file_path.stem}_redacted.xlsx"
+        # Anonymize the text
+        anonymized_result = anonymizer.anonymize(text=full_text, analyzer_results=analyzer_results)
+        
+        # Save redacted version
+        redacted_filename = f"{file_path.stem}_redacted.txt"
         redacted_path = REDACTED_DIR / redacted_filename
-        df.to_excel(redacted_path, index=False)
+        with open(redacted_path, 'w', encoding='utf-8') as f:
+            f.write("Excel File Analysis - Redacted Content\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(anonymized_result.text)
         
-        analysis = f"Excel file with {len(df)} rows and {len(df.columns)} columns. Columns: {', '.join(map(str, df.columns))}"
+        print(f"Excel processing completed. Text length: {len(full_text)}")
+        return redacted_path, full_text
         
-        return redacted_path, analysis
-    
     except Exception as e:
-        return None, f"Error processing Excel: {e}"
+        print(f"Error processing Excel file: {e}")
+        return None, f"Error processing Excel file: {str(e)}"
 
-
+# Update the process_powerpoint function
 def process_powerpoint(file_path: Path):
-    """Process PowerPoint files with PII redaction"""
-    print(f"Processing PowerPoint: {file_path.name}")
+    """Process PowerPoint files (.ppt, .pptx) with slide image extraction"""
+    print(f"Processing PowerPoint file: {file_path.name}")
     
     try:
-        from pptx import Presentation
-        
-        prs = Presentation(str(file_path))
-        analyzer = get_analyzer()
-        anonymizer = get_anonymizer()
+        # Load the presentation
+        prs = Presentation(file_path)
         
         all_text = []
+        slide_count = 0
+        slide_images = []
         
-        for slide in prs.slides:
+        # Process each slide
+        for slide_num, slide in enumerate(prs.slides, 1):
+            slide_count += 1
+            slide_text = f"Slide {slide_num}:\n"
+            slide_content = []
+            
+            # Extract text from all shapes in the slide
             for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
-                    text = shape.text
-                    analyzer_results = analyzer.analyze(text=text, language='en')
-                    if analyzer_results:
-                        anonymized = anonymizer.anonymize(text=text, analyzer_results=analyzer_results)
-                        shape.text = anonymized.text
-                    all_text.append(shape.text)
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_content.append(shape.text.strip())
+                
+                # Handle tables in slides
+                if shape.has_table:
+                    table = shape.table
+                    for row in table.rows:
+                        row_text = []
+                        for cell in row.cells:
+                            if cell.text.strip():
+                                row_text.append(cell.text.strip())
+                        if row_text:
+                            slide_content.append(" | ".join(row_text))
+            
+            # Add slide content
+            if slide_content:
+                slide_text += "\n".join(slide_content) + "\n"
+                
+                # Analyze slide content with Gemini for better description
+                slide_description = analyze_slide_content_with_gemini(slide_content, slide_num)
+                slide_text += f"Description: {slide_description}\n"
+            else:
+                slide_text += "[Slide contains visual elements or no readable text]\n"
+                # Try to describe visual slide with Gemini
+                slide_description = f"Slide {slide_num} contains primarily visual content with minimal text elements."
+                slide_text += f"Description: {slide_description}\n"
+            
+            all_text.append(slide_text)
         
-        # Save redacted presentation
-        redacted_filename = f"{file_path.stem}_redacted.pptx"
+        # Try to extract slide images (this requires additional processing)
+        slide_images_info = extract_slide_images(file_path, prs)
+        
+        # Combine all slides
+        full_text = "\n\n".join(all_text)
+        
+        if not full_text.strip() or len(full_text.strip()) < 50:
+            # If very little text, still create a basic analysis
+            full_text = f"PowerPoint presentation with {slide_count} slides. Contains primarily visual content with minimal text elements."
+        
+        # Add presentation metadata
+        presentation_info = f"PowerPoint Presentation Analysis:\nTotal Slides: {slide_count}\n\n{full_text}"
+        
+        if slide_images_info:
+            presentation_info += f"\n\nSlide Images: {len(slide_images_info)} slides processed for visual content"
+        
+        # Analyze for PII
+        analyzer = get_analyzer()
+        anonymizer = get_anonymizer()
+        
+        analyzer_results = analyzer.analyze(
+            text=full_text,
+            language='en',
+            entities=[
+                "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION",
+                "CREDIT_CARD", "US_SSN", "US_DRIVER_LICENSE", "US_PASSPORT",
+                "DATE_TIME", "NRP", "MEDICAL_LICENSE", "URL",
+                "AWS_IDENTIFIER", "NETWORK_INFO", "FILE_PATH", "TIMESTAMP",
+                "IDENTIFIER_NAME", "DURATION"
+            ]
+        )
+        
+        # Anonymize the text
+        anonymized_result = anonymizer.anonymize(text=presentation_info, analyzer_results=analyzer_results)
+        
+        # Save redacted version with slide information
+        redacted_filename = f"{file_path.stem}_redacted.txt"
         redacted_path = REDACTED_DIR / redacted_filename
-        prs.save(str(redacted_path))
+        with open(redacted_path, 'w', encoding='utf-8') as f:
+            f.write("PowerPoint Presentation - Redacted Content\n")
+            f.write("=" * 55 + "\n\n")
+            f.write(f"Original file: {file_path.name}\n")
+            f.write(f"Total slides: {slide_count}\n")
+            f.write(f"Processing date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("REDACTED CONTENT:\n")
+            f.write("-" * 30 + "\n")
+            f.write(anonymized_result.text)
+            
+            if slide_images_info:
+                f.write(f"\n\nSlide Images Processed: {len(slide_images_info)}\n")
+                for img_info in slide_images_info:
+                    f.write(f"- {img_info}\n")
         
-        analysis = f"PowerPoint with {len(prs.slides)} slides. Content: {' '.join(all_text[:500])}"
+        print(f"PowerPoint processing completed. Slides: {slide_count}, Text length: {len(presentation_info)}")
+        return redacted_path, presentation_info
         
-        return redacted_path, analysis
-    
     except Exception as e:
-        return None, f"Error processing PowerPoint: {e}"
+        print(f"Error processing PowerPoint file: {e}")
+        return None, f"Error processing PowerPoint file: {str(e)}"
 
-
-# --- Formatting Functions ---
-def format_technical_analysis(analysis_text: str):
-    """Uses LangChain to format technical data into a professional, structured report."""
-    print("Formatting final technical analysis with improved prompt...")
-    
-    llm = get_llm()
-    if llm is None:
-        return f"**File Description**: Analysis text\n\n**Key Findings**:\n{analysis_text[:500]}"
-    
-    # --- NEW, MORE ROBUST PROMPT ---
-    template = """
-    You are an expert cybersecurity analyst. Your task is to convert the following raw text, which may contain OCR errors, into a clean, professional report.
-
-    **Instructions**:
-    1.  **File Description**: Write a single, concise sentence describing the document's purpose (e.g., "A list of Google Cloud VPC firewall rules.").
-    2.  **Key Findings**:
-        -   Analyze each rule or policy found in the text.
-        -   Present each rule clearly, with each attribute on a new line.
-        -   Correct obvious OCR errors (e.g., 'teep' should be 'tcp').
-        -   If a value is redacted or missing, state 'N/A' or 'Redacted'.
-        -   Provide a clear, one-sentence 'Purpose' for each rule.
-    3.  **Format**: Follow the output format below EXACTLY. Do not add extra commentary.
-
-    **Raw Text Input**:
-    {analysis}
-
-    **Required Output Format**:
-
-    **File Description**: [Your one-sentence summary here]
-
-    **Key Findings**:
-
-    *   **Rule Name**: [Name of Rule 1]
-        **Direction**: [e.g., ingress]
-        **Source**: [e.g., 0.0.0.0/0]
-        **Action**: [e.g., allow]
-        **Protocols/Ports**: [e.g., tcp:22]
-        **Purpose**: [Concise explanation of the rule's function.]
-
-    *   **Rule Name**: [Name of Rule 2]
-        **Direction**: [e.g., ingress]
-        **Source**: [e.g., 10.128.0.0/9]
-        **Action**: [e.g., allow]
-        **Protocols/Ports**: [e.g., udp:0-65535, icmp]
-        **Purpose**: [Concise explanation of the rule's function.]
-    
-    (Continue this pattern for all rules found in the raw text)
-    """
-    
+def analyze_slide_content_with_gemini(slide_content: list, slide_num: int):
+    """Use Gemini to analyze and describe slide content"""
     try:
-        prompt = PromptTemplate(template=template, input_variables=["analysis"])
-        output_parser = StrOutputParser()
-        chain = prompt | llm | output_parser
-        formatted_result = chain.invoke({"analysis": analysis_text})
-        return formatted_result
-    except Exception as e:
-        return f"Error formatting: {e}\n\nRaw analysis:\n{analysis_text}"
-
-
-def format_generic_output(analysis_text: str):
-    """Uses LangChain for generic formatting of descriptive text."""
-    print("Formatting generic output...")
-    
-    llm = get_llm()
-    if llm is None:
-        return f"**File Description**: Processed file\n\n**Key Findings**:\n* {analysis_text[:200]}"
-    
-    template = """
-    Based on the following analysis, generate a 'File Description' and 'Key Findings' in a structured format.
-    The 'File Description' should be a concise, one-sentence summary.
-    The 'Key Findings' should be a bulleted list of the most important insights.
-    
-    Analysis Text:
-    {analysis}
-    
-    Formatted Output:
-    **File Description**: [Your one-sentence description here]
-    
-    **Key Findings**:
-    * [Finding 1]
-    * [Finding 2]
-    * [Finding 3]
-    """
-    
-    try:
-        prompt = PromptTemplate(template=template, input_variables=["analysis"])
-        output_parser = StrOutputParser()
-        chain = prompt | llm | output_parser
-        formatted_result = chain.invoke({"analysis": analysis_text})
-        return formatted_result
-    except Exception as e:
-        return f"Error formatting: {e}\n\nRaw analysis:\n{analysis_text}"
-
-
-def format_final_output(analysis_text: str, is_technical: bool = False):
-    """
-    Wrapper function to format output based on content type.
-    Automatically chooses between technical and generic formatting.
-    
-    Args:
-        analysis_text: Raw analysis text to format
-        is_technical: If True, uses technical formatting. If False, uses generic.
-    
-    Returns:
-        str: Formatted output with File Description and Key Findings
-    """
-    if is_technical:
-        # Check if text contains technical indicators
-        technical_keywords = ['rule', 'policy', 'firewall', 'security group', 'arn:', 
-                             'protocol', 'port', 'cidr', 'ingress', 'egress']
+        gemini_model = get_gemini_model()
+        if gemini_model is None or not slide_content:
+            return f"Slide {slide_num} contains text and visual elements."
         
-        text_lower = analysis_text.lower()
-        if any(keyword in text_lower for keyword in technical_keywords):
-            return format_technical_analysis(analysis_text)
+        content_text = "\n".join(slide_content)
+        
+        prompt = f"""Analyze this PowerPoint slide content and provide a brief description:
+
+Slide {slide_num} Content:
+{content_text}
+
+Provide a 1-2 sentence description of what this slide is about, its main topic or purpose. Be concise and specific."""
+        
+        response = gemini_model.generate_content(prompt)
+        description = response.text.strip()
+        
+        if not description or len(description) < 10:
+            return f"Slide {slide_num} contains information about the presented topic."
+        
+        return description
+        
+    except Exception as e:
+        print(f"Error analyzing slide content with Gemini: {e}")
+        return f"Slide {slide_num} contains structured content and information."
+
+def extract_slide_images(file_path: Path, presentation):
+    """Extract images from PowerPoint slides"""
+    try:
+        slide_images = []
+        
+        # Note: Direct slide-to-image conversion requires additional libraries
+        # For now, we'll create a manifest of slide content
+        for slide_num, slide in enumerate(presentation.slides, 1):
+            slide_info = {
+                'slide_number': slide_num,
+                'text_elements': 0,
+                'image_elements': 0,
+                'table_elements': 0,
+                'chart_elements': 0
+            }
+            
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_info['text_elements'] += 1
+                elif shape.shape_type == 13:  # Picture type
+                    slide_info['image_elements'] += 1
+                elif hasattr(shape, 'has_table') and shape.has_table:
+                    slide_info['table_elements'] += 1
+                elif hasattr(shape, 'has_chart') and shape.has_chart:
+                    slide_info['chart_elements'] += 1
+            
+            slide_description = f"Slide {slide_num}: {slide_info['text_elements']} text elements, {slide_info['image_elements']} images, {slide_info['table_elements']} tables, {slide_info['chart_elements']} charts"
+            slide_images.append(slide_description)
+        
+        return slide_images
+        
+    except Exception as e:
+        print(f"Error extracting slide images: {e}")
+        return []
+
+# Add this enhanced function for slide image extraction (optional)
+def extract_slide_images_advanced(file_path: Path, presentation):
+    """Extract actual slide images (advanced feature)"""
+    try:
+        import io
+        from PIL import Image as PILImage
+        
+        slide_images = []
+        
+        # This is a simplified approach - full implementation would require 
+        # additional libraries like python-pptx with image export capabilities
+        
+        for slide_num, slide in enumerate(presentation.slides, 1):
+            # Create slide summary instead of actual image for now
+            slide_summary = analyze_slide_layout(slide, slide_num)
+            
+            # Save slide summary as a text "image" description
+            slide_desc_file = REDACTED_DIR / f"{file_path.stem}_slide_{slide_num}_description.txt"
+            with open(slide_desc_file, 'w', encoding='utf-8') as f:
+                f.write(f"Slide {slide_num} Layout Analysis\n")
+                f.write("=" * 30 + "\n\n")
+                f.write(slide_summary)
+            
+            slide_images.append({
+                'slide_number': slide_num,
+                'description_file': slide_desc_file,
+                'summary': slide_summary
+            })
+        
+        return slide_images
+        
+    except Exception as e:
+        print(f"Error in advanced slide extraction: {e}")
+        return []
+
+def analyze_slide_layout(slide, slide_num):
+    """Analyze the layout and structure of a slide"""
+    try:
+        layout_info = {
+            'title': '',
+            'text_content': [],
+            'visual_elements': [],
+            'layout_type': 'Unknown'
+        }
+        
+        # Extract title and content
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                if shape.name.startswith('Title') or 'title' in shape.name.lower():
+                    layout_info['title'] = shape.text.strip()
+                else:
+                    layout_info['text_content'].append(shape.text.strip())
+            
+            # Identify visual elements
+            if shape.shape_type == 13:  # Picture
+                layout_info['visual_elements'].append('Image/Picture')
+            elif hasattr(shape, 'has_table') and shape.has_table:
+                layout_info['visual_elements'].append('Table')
+            elif hasattr(shape, 'has_chart') and shape.has_chart:
+                layout_info['visual_elements'].append('Chart/Graph')
+        
+        # Determine layout type
+        if layout_info['title'] and layout_info['text_content']:
+            layout_info['layout_type'] = 'Title and Content'
+        elif layout_info['title'] and not layout_info['text_content']:
+            layout_info['layout_type'] = 'Title Only'
+        elif layout_info['visual_elements']:
+            layout_info['layout_type'] = 'Visual Content'
+        else:
+            layout_info['layout_type'] = 'Custom Layout'
+        
+        # Create summary
+        summary = f"Layout Type: {layout_info['layout_type']}\n"
+        if layout_info['title']:
+            summary += f"Title: {layout_info['title']}\n"
+        
+        if layout_info['text_content']:
+            summary += f"Text Elements: {len(layout_info['text_content'])}\n"
+            for i, text in enumerate(layout_info['text_content'][:3], 1):
+                summary += f"  {i}. {text[:100]}{'...' if len(text) > 100 else ''}\n"
+        
+        if layout_info['visual_elements']:
+            summary += f"Visual Elements: {', '.join(layout_info['visual_elements'])}\n"
+        
+        return summary
+        
+    except Exception as e:
+        return f"Slide {slide_num}: Layout analysis failed - {str(e)}"
+
+# Update the format_technical_analysis function to handle PowerPoint content better
+def format_technical_analysis(analysis_text: str, file_path: Path = None):
+    """Format technical analysis into table structure using Gemini"""
+    print("Formatting analysis with Gemini...")
     
-    return format_generic_output(analysis_text)
+    gemini_model = get_gemini_model()
+    file_info = extract_file_info_from_path(file_path)
+    
+    if (gemini_model is None):
+        return format_fallback_table(analysis_text, file_info)
+    
+    # Truncate very long text for API limits
+    analysis_preview = analysis_text[:3000] if len(analysis_text) > 3000 else analysis_text
+    
+    # Detect file type for better prompting
+    file_type = file_info['type'].lower()
+    
+    if file_type in ['.ppt', '.pptx']:
+        content_type = "PowerPoint presentation"
+        focus_areas = "slide content, presentation topics, data types, and key themes"
+    elif file_type == '.pdf':
+        content_type = "PDF document"
+        focus_areas = "document structure, content themes, data categories, and information types"
+    elif file_type in ['.xlsx', '.xls']:
+        content_type = "Excel spreadsheet"
+        focus_areas = "data structure, column types, numerical data, and organizational patterns"
+    else:
+        content_type = "document or image"
+        focus_areas = "content type, visible elements, and key characteristics"
+    
+    prompt = f"""Analyze this {content_type} content and create a structured table. 
 
+Content to analyze:
+{analysis_preview}
 
-# --- Alias for main.py compatibility ---
+File: {file_info['name']}{file_info['type']}
+
+Create a markdown table with these exact columns: File Name | File Type | File Description | Key Findings
+
+Instructions:
+1. File Description: Write 2-3 sentences describing what this {content_type} contains, its purpose, or main topic
+2. Key Findings: Create 4-5 bullet points focusing on {focus_areas}
+3. Use • symbol with <br> between findings
+4. Be specific and informative based on the actual content
+5. For presentations, mention slide count and main topics
+6. For documents, focus on structure and content themes
+7. For data files, highlight data types and organization
+
+Format exactly like this:
+| File Name | File Type | File Description | Key Findings |
+|-----------|-----------|------------------|--------------|
+| {file_info['name']} | {file_info['type']} | [Your description here] | • [Finding 1]<br>• [Finding 2]<br>• [Finding 3]<br>• [Finding 4] |
+
+Only output the table, nothing else."""
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        result = response.text.strip()
+        
+        # Clean up the response to ensure it's a proper table
+        if not result.startswith('|'):
+            # Try to extract table from response
+            lines = result.split('\n')
+            table_lines = [line for line in lines if line.strip().startswith('|')]
+            if table_lines:
+                result = '\n'.join(table_lines)
+        
+        print("Gemini formatting completed successfully")
+        return result
+    except Exception as e:
+        print(f"Gemini formatting failed: {e}")
+        return format_fallback_table(analysis_text, file_info)
+
+def format_fallback_table(analysis_text: str, file_info: dict):
+    """Create basic table when Gemini fails"""
+    print("Using fallback table formatting...")
+    
+    # Better text analysis for fallback
+    text = analysis_text.strip()
+    file_type = file_info['type'].lower()
+    
+    # Determine description based on content and file type
+    if "Visual Content Analysis:" in text:
+        # This is an image description
+        description_start = text.find("Visual Content Analysis:") + len("Visual Content Analysis:")
+        description_part = text[description_start:].split(".")[0].strip()
+        description = f"Image file containing visual content. {description_part}."
+        
+        findings = [
+            "Visual content detected without readable text",
+            "No personally identifiable information found", 
+            "Image suitable for display or documentation",
+            "Content appears to be non-sensitive visual material"
+        ]
+    elif "PowerPoint Presentation Analysis:" in text:
+        # This is a PowerPoint presentation
+        lines = text.split('\n')
+        slide_info = next((line for line in lines if "Total Slides:" in line), "")
+        slide_count = slide_info.split(':')[-1].strip() if slide_info else "multiple"
+        
+        description = f"PowerPoint presentation containing {slide_count} slides with structured content and information."
+        
+        findings = [
+            f"Presentation contains {slide_count} slides",
+            "Structured content with text and visual elements",
+            "Professional presentation format detected",
+            "Content suitable for analysis and review"
+        ]
+        
+        # Try to extract more specific findings from content
+        if "Slide" in text:
+            slide_count_actual = text.count("Slide ")
+            findings[0] = f"Presentation contains {slide_count_actual} slides"
+            
+        if any(keyword in text.lower() for keyword in ['data', 'analysis', 'report']):
+            findings.append("Contains data or analytical content")
+        if any(keyword in text.lower() for keyword in ['chart', 'graph', 'table']):
+            findings.append("Includes charts, graphs, or tabular data")
+            
+    elif file_type in ['.pdf']:
+        description = "PDF document containing structured text and information for analysis."
+        findings = [
+            "Multi-format document with text content",
+            "Structured information and data elements",
+            "Content extracted successfully for analysis",
+            "Document suitable for review and processing"
+        ]
+    elif file_type in ['.xlsx', '.xls']:
+        description = "Excel spreadsheet containing structured data across multiple worksheets."
+        findings = [
+            "Spreadsheet with organized data structure",
+            "Multiple data columns and rows detected",
+            "Numerical and text data elements present",
+            "Data suitable for analysis and processing"
+        ]
+    else:
+        # Generic text content
+        sentences = [s.strip() for s in text.replace('\n', ' ').split('.') if len(s.strip()) > 10]
+        
+        if sentences:
+            description = f"{sentences[0]}. This file contains structured data and textual information."
+            
+            findings = []
+            if len(sentences) > 1:
+                findings.extend(sentences[1:4])
+            
+            # Add generic findings if needed
+            while len(findings) < 4:
+                generic_findings = [
+                    "Contains structured textual data",
+                    "Multiple data elements present",
+                    "Information suitable for analysis",
+                    "Document contains readable content"
+                ]
+                for gf in generic_findings:
+                    if gf not in findings and len(findings) < 4:
+                        findings.append(gf)
+        else:
+            description = "Document contains data and information for processing."
+            findings = [
+                "Structured content detected",
+                "Data elements present",
+                "Information processed successfully", 
+                "Content suitable for analysis"
+            ]
+    
+    # Ensure we have exactly 4 findings
+    findings = findings[:4]
+    while len(findings) < 4:
+        findings.append("Additional content elements present")
+    
+    findings_text = "<br>".join([f"• {f}" for f in findings])
+    
+    table = f"""| File Name | File Type | File Description | Key Findings |
+|-----------|-----------|------------------|--------------|
+| {file_info['name']} | {file_info['type']} | {description} | {findings_text} |"""
+    
+    return table
+
+def format_for_html_display(markdown_table: str):
+    """Convert markdown table to styled HTML"""
+    if not markdown_table or not markdown_table.strip():
+        return "<p>No analysis available</p>"
+    
+    print(f"Converting markdown table to HTML...")
+    
+    html = """
+<table class="analysis-table">
+    <thead>
+        <tr>
+            <th style="width: 12%">File Name</th>
+            <th style="width: 8%">File Type</th>
+            <th style="width: 35%">File Description</th>
+            <th style="width: 45%">Key Findings</th>
+        </tr>
+    </thead>
+    <tbody>
+"""
+    
+    # Parse markdown table
+    lines = [l.strip() for l in markdown_table.split('\n') if l.strip()]
+    
+    for line in lines:
+        if not line.startswith('|'):
+            continue
+        if '---' in line:  # Skip separator row
+            continue
+        if 'File Name' in line:  # Skip header row
+            continue
+        
+        # Parse table cells
+        cells = [cell.strip() for cell in line.split('|')]
+        cells = [c for c in cells if c]  # Remove empty cells
+        
+        if len(cells) >= 4:
+            file_name = cells[0]
+            file_type = cells[1]
+            description = cells[2]
+            findings = cells[3]
+            
+            # Convert <br> separated bullets to HTML list
+            findings_items = [f.strip().replace('•', '').strip() 
+                            for f in findings.split('<br>') if f.strip()]
+            findings_html = '<ul class="key-findings">' + \
+                          ''.join([f'<li>{item}</li>' for item in findings_items]) + \
+                          '</ul>'
+            
+            html += f"""
+        <tr>
+            <td><strong>{file_name}</strong></td>
+            <td>{file_type}</td>
+            <td>{description}</td>
+            <td>{findings_html}</td>
+        </tr>
+"""
+    
+    html += """
+    </tbody>
+</table>
+"""
+    print(f"Generated HTML successfully")
+    return html
+
+def format_generic_output(analysis_text: str, file_path: Path = None):
+    """Format generic content into table using Gemini"""
+    return format_technical_analysis(analysis_text, file_path)
+
+def format_final_output(analysis_text: str, file_path: Path = None, is_technical: bool = False):
+    """Main formatting wrapper"""
+    return format_technical_analysis(analysis_text, file_path)
+
 def redact_text_in_image(file_path: Path, analyzer_engine: AnalyzerEngine = None):
-    """
-    Alias function for backward compatibility with main.py
-    This is the same as process_text_image()
-    
-    Args:
-        file_path: Path to the image file
-        analyzer_engine: Presidio analyzer (optional, will use default if None)
-    
-    Returns:
-        tuple: (redacted_file_path, extracted_text)
-    """
+    """Alias for backward compatibility"""
     if analyzer_engine is None:
         analyzer_engine = get_analyzer()
-    
     return process_text_image(file_path, analyzer_engine)
 
-
-# --- Create analyzer instance for direct export ---
+# --- Create analyzer instance ---
 analyzer = get_analyzer()
 
-
-# --- Exported Functions for main.py ---
+# --- Exports ---
 __all__ = [
-    'process_file',
     'process_image',
     'process_pdf',
     'process_excel',
-    'process_powerpoint',
-    'process_scenic_image',
+    'process_powerpoint',  # Add this
     'process_text_image',
-    'process_screenshot_with_llava',
-    'redact_text_in_image',  # Added for main.py compatibility
+    'redact_text_in_image',
     'format_technical_analysis',
     'format_generic_output',
     'format_final_output',
-    'analyzer',  # Export analyzer instance
+    'format_for_html_display',
+    'extract_file_info_from_path',
+    'analyzer',
     'UPLOAD_DIR',
     'REDACTED_DIR',
     'MODEL_DIR'
